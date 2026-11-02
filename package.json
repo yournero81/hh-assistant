@@ -1,0 +1,15 @@
+{
+  "name": "hh-local-assistant",
+  "private": true,
+  "version": "0.2.0",
+  "description": "Локальный помощник по поиску работы",
+  "dependencies": {
+    "playwright": "1.62.1"
+  },
+  "scripts": {
+    "browser": "node browser.cjs",
+    "test:browser": "node tests/browser.test.cjs",
+    "test:chats": "node tests/chats.test.cjs",
+    "test:questionnaire": "node tests/questionnaire.test.cjs"
+  }
+}
