@@ -1,0 +1,12 @@
+data
+node_modules
+runtime
+_internal
+*.exe
+*.dpapi
+*.sqlite3*
+*.log
+.env*
+.git
+__pycache__
+tests

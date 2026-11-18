@@ -12,7 +12,8 @@ function answerFor(question,profile,prefs){
   if(/в каком городе|город.*прожива|где.*прожива|где.*жив[её]те/.test(q))answers.push('Проживаю в Москве.');
   if(/образован|где.*учит|где.*обуч|вуз|специальност/.test(q))answers.push(profile.education);
   if(/командиров/.test(q))answers.push(profile.travel);
-  if(/проект|диплом|вкр/.test(q))answers.push(profile.project);
+  if(/(?:вас|тебя)\s+(?:это\s+)?устраивает|вс[её]\s+это\s+умеете|(?:испытательн\w+\s+срок|ставк[аи])/.test(q))return null;
+  if(/(?:расскажите|опишите|приведите пример).*(?:проект|диплом|вкр)/.test(q))answers.push(profile.project);
   const skills=[];
   for(const [name,detail] of Object.entries(profile.skills)){
     const probes={'SQL':/\bsql\b/,'Python':/\bpython\b/,'Power BI':/power\s*bi/,'Excel':/excel/,'бизнес-анализ':/бизнес.анализ|бизнес.процесс/};

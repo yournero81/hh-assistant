@@ -3,11 +3,17 @@ const readline = require('node:readline');
 const path = require('node:path');
 const chats = require('./browser-chats.cjs');
 const questionnaire=require('./questionnaire.cjs');
-const candidateProfile=require(require('node:fs').existsSync(path.join(__dirname,'profile.json'))?'./profile.json':'./profile.example.json');
+const candidateProfile=process.env.HH_PROFILE_JSON?JSON.parse(process.env.HH_PROFILE_JSON):require('./profile.json');
 let context;
 async function browser() {
   if (!context) {
     context = await chromium.launchPersistentContext(process.env.HH_ASSISTANT_BROWSER_DIR||path.join(__dirname,'data','browser'), {headless:process.env.HH_ASSISTANT_HEADLESS==='1', viewport:{width:1200,height:850}});
+    if(process.env.HH_BROWSER_STATE){
+      const saved=JSON.parse(process.env.HH_BROWSER_STATE);
+      if(saved.cookies?.length)await context.addCookies(saved.cookies);
+      await context.addInitScript(origins=>{const saved=origins.find(o=>o.origin===location.origin);if(saved)for(const item of saved.localStorage||[])localStorage.setItem(item.name,item.value);},saved.origins||[]);
+      delete process.env.HH_BROWSER_STATE;
+    }
     context.setDefaultTimeout(12000);
     context.on('close',()=>context=null);
   }
@@ -38,20 +44,39 @@ async function rendered(locator){
   }));
 }
 async function shown(page,pattern){return rendered(page.getByText(pattern));}
+let captchaPage=null;
+const success=/Отклик\s+отправлен|Вы\s+откликнулись|Вы\s+успешно\s+откликнулись/i;
+async function pauseForCaptcha(page){
+  captchaPage=page;
+  await page.bringToFront().catch(()=>{});
+  return {blocked:'Пройди капчу в открытой вкладке hh.ru. После подтверждения отклика очередь продолжится автоматически.'};
+}
 async function applicationReceipt(page,id){
-  const success=/Отклик\s+отправлен|Вы\s+откликнулись|Вы\s+успешно\s+откликнулись/i;
+  const challenge=/Пройдите\s+капчу|Текст\s+с\s+картинки|Пожалуйста,\s*подтвердите,\s*что\s+вы\s+не\s*робот/i;
   let confirmed=false;
   for(let attempt=0;attempt<60;attempt++){
     if(page.isClosed())return null;
-    try{if(await shown(page,success)){confirmed=true;break;}}catch{}
+    try{
+      if(await shown(page,challenge))return pauseForCaptcha(page);
+      if(await shown(page,success)){confirmed=true;break;}
+    }catch{}
     await page.waitForTimeout(250).catch(()=>{});
   }
   if(!confirmed){
+    // Preserve the result page before read-only recovery replaces its validation UI.
+    const fs=require('node:fs/promises');
+    const folder=path.join(__dirname,'data','diagnostics');
+    await fs.mkdir(folder,{recursive:true});
+    await fs.writeFile(path.join(folder,`response-${id}.json`),JSON.stringify({url:page.url(),text:await page.locator('body').innerText().catch(()=>'' )},null,2));
+    await page.screenshot({path:path.join(folder,`response-${id}.png`)}).catch(()=>{});
     // A read-only check can recover a successful POST followed by navigation.
     // This never presses the submit button a second time.
     await page.goto(`https://hh.ru/applicant/vacancy_response?vacancyId=${id}`,{waitUntil:'domcontentloaded'});
     for(let attempt=0;attempt<40;attempt++){
-      try{if(await shown(page,success)){confirmed=true;break;}}catch{}
+      try{
+        if(await shown(page,challenge))return pauseForCaptcha(page);
+        if(await shown(page,success)){confirmed=true;break;}
+      }catch{}
       await page.waitForTimeout(250);
     }
   }
@@ -91,6 +116,15 @@ async function readable(page,url) {
   return text;
 }
 async function run(cmd) {
+  if(cmd.action==='export_session')return {browser_state:context?await context.storageState():null};
+  if(cmd.action==='captcha_status'){
+    if(!captchaPage||captchaPage.isClosed())return {status:'closed'};
+    if(await shown(captchaPage,success)){
+      captchaPage=null;
+      return {status:'applied'};
+    }
+    return {status:'waiting'};
+  }
   if(cmd.action==='close') { if(context) await context.close(); return {status:'closed'}; }
   const ctx=await browser();
   if(cmd.action==='session')return chats.session(ctx);
@@ -107,7 +141,7 @@ async function run(cmd) {
     try {
       const q=new URLSearchParams({text:cmd.params.text,area:cmd.params.area,search_field:'name',order_by:'publication_time',date_from:new Date(Date.now()-7*86400000).toISOString().slice(0,10),page:String(cmd.params.page||0)});
       if(cmd.params.work_format)q.set('work_format',cmd.params.work_format);
-      q.set('experience','noExperience');
+      q.set('experience',cmd.params.experience||'noExperience');
       await readable(p,'https://hh.ru/search/vacancy?'+q);
       try { await p.locator('[data-qa="serp-item__title"],[data-qa="vacancy-serp__vacancy-title"]').first().waitFor({timeout:15000}); }
       catch {
@@ -207,12 +241,14 @@ async function run(cmd) {
     submitted=true;
     await submit.click();
     const receipt=await applicationReceipt(p,cmd.id);
+    if(receipt?.blocked)return {status:'uncertain',captcha:true,answers:answered,detail:receipt.blocked};
     if(!receipt)return {status:'uncertain',answers:answered,detail:'Кнопка нажата, но подтверждение не найдено. Проверь отклики hh.ru; повторная отправка заблокирована.'};
     await p.close(); return {status:'applied',chat_id:receipt.chat_id,answers:answered,detail:'Получено подтверждение hh.ru.'};
   } catch(e) {
     if(submitted){
       try{
         const receipt=await applicationReceipt(p,cmd.id);
+        if(receipt?.blocked)return {status:'uncertain',captcha:true,answers:answered,detail:receipt.blocked};
         if(receipt){await p.close();return {status:'applied',chat_id:receipt.chat_id,answers:answered,detail:'Отправка подтверждена повторной проверкой страницы hh.ru.'};}
       }catch{}
     }

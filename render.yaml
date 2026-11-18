@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: hh-assistant
+    runtime: docker
+    plan: free
+    healthCheckPath: /healthz
+    numInstances: 1
+    envVars:
+      - key: HH_MASTER_KEY
+        generateValue: true
+      - key: HH_ACCESS_PASSWORD
+        generateValue: true
+      - key: HH_MODEL_API_KEY
+        sync: false
+      - key: HH_PROFILE_JSON
+        sync: false
+      - key: HH_DATABASE_URL
+        sync: false

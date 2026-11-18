@@ -23,15 +23,18 @@ import uuid
 import webbrowser
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from hr_review import draft_reply, message_text
+from reply_model import ReplyModel, ModelError
 
 ROOT = Path(sys.executable).resolve().parent if getattr(sys,'frozen',False) else Path(__file__).resolve().parent
-DATA = ROOT / 'data'
+DATA = Path(os.environ.get('HH_DATA_DIR', str(ROOT / 'data')))
 MSK = timezone(timedelta(hours=3))
 DEFAULTS = dict(min_salary=60000, target_salary=70000, interval_minutes=30,
                 daily_limit=15, resume_id='', user_agent='TimurJobAssistant/0.2', chat_interval_minutes=5,
                 auto_apply=False, auto_reply=False, enabled=False,
+                model_provider='deepseek',model_name='deepseek-flash',model_enabled=False,
                 queries=['бизнес-аналитик', 'системный аналитик', 'аналитик данных', 'BI аналитик', 'аналитик бизнес-процессов'])
-PROFILE = json.loads((ROOT / ('profile.json' if (ROOT/'profile.json').exists() else 'profile.example.json')).read_text(encoding='utf-8'))
+PROFILE = json.loads(os.environ['HH_PROFILE_JSON']) if os.environ.get('HH_PROFILE_JSON') else json.loads((ROOT / 'profile.json').read_text(encoding='utf-8'))
 
 
 def now():
@@ -47,6 +50,9 @@ class Store:
         self.folder = Path(folder)
         self.folder.mkdir(parents=True, exist_ok=True)
         self.db = self.folder / 'assistant.sqlite3'
+        if os.environ.get('HH_DATABASE_URL'):
+            from pg_store import initialize
+            initialize()
         with self.connect() as db:
             db.executescript('''
             CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY CHECK(id=1), body TEXT NOT NULL);
@@ -59,6 +65,8 @@ class Store:
             CREATE TABLE IF NOT EXISTS messages (chat_id TEXT, id TEXT, body TEXT, status TEXT,
               PRIMARY KEY(chat_id,id));
             CREATE TABLE IF NOT EXISTS outbox (id TEXT PRIMARY KEY, chat_id TEXT, text TEXT, status TEXT, created TEXT);
+            CREATE TABLE IF NOT EXISTS documents (name TEXT PRIMARY KEY, body TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS hr_reviews (task_id INTEGER PRIMARY KEY, body TEXT NOT NULL);
             ''')
             db.execute('INSERT OR IGNORE INTO settings VALUES (1,?)', (json.dumps(DEFAULTS),))
             # Crash recovery: uncertain mutations are never automatically retried.
@@ -72,6 +80,11 @@ class Store:
 
     @contextmanager
     def connect(self):
+        if os.environ.get('HH_DATABASE_URL'):
+            from pg_store import connect
+            with connect() as db:
+                yield db
+            return
         db = sqlite3.connect(self.db, timeout=15)
         db.row_factory = sqlite3.Row
         try:
@@ -79,6 +92,11 @@ class Store:
                 yield db
         finally:
             db.close()
+
+    def resume_context(self):
+        with self.connect() as db:
+            row=db.execute("SELECT body FROM documents WHERE name='resume'").fetchone()
+        return row[0] if row else ''
 
     def settings(self):
         with self.connect() as db:
@@ -91,7 +109,7 @@ class Store:
             if key not in incoming:
                 continue
             v = incoming[key]
-            if key in ('enabled', 'auto_apply', 'auto_reply'):
+            if key in ('enabled', 'auto_apply', 'auto_reply', 'model_enabled'):
                 if not isinstance(v, bool):
                     raise ValueError('Ожидалось логическое значение')
             elif key in ('min_salary', 'target_salary', 'interval_minutes', 'daily_limit', 'chat_interval_minutes'):
@@ -134,8 +152,11 @@ class Store:
             vacancies = [dict(r) for r in db.execute('SELECT * FROM vacancies ORDER BY score DESC,updated DESC LIMIT 250')]
             for v in vacancies:
                 v['body'] = json.loads(v['body'])
+            tasks=[dict(r) for r in db.execute("SELECT tasks.*,COALESCE(hr_reviews.body,'{}') AS review FROM tasks LEFT JOIN hr_reviews ON hr_reviews.task_id=tasks.id WHERE status!='done' ORDER BY id DESC LIMIT 500")]
+            for task in tasks:
+                task['review']=json.loads(task['review'])
             return dict(settings=self.settings(), vacancies=vacancies,
-                        tasks=[dict(r) for r in db.execute("SELECT * FROM tasks WHERE status!='done' ORDER BY id DESC LIMIT 200")],
+                        tasks=tasks,
                         events=[dict(r) for r in db.execute('SELECT * FROM events ORDER BY id DESC LIMIT 100')],
                         outbox=[dict(r) for r in db.execute('SELECT * FROM outbox ORDER BY created DESC LIMIT 50')])
 
@@ -143,13 +164,19 @@ class Store:
 class Vault:
     """DPAPI binds secrets to the current Windows login. Never returned by HTTP."""
     def __init__(self, folder=DATA):
-        self.path = Path(folder) / 'secrets.dpapi'
+        self.path = Path(folder) / ('secrets.dpapi' if os.name=='nt' else 'secrets.encrypted')
         self.lock = threading.RLock()
 
     @staticmethod
     def crypt(data, decrypt=False):
-        if os.name != 'nt':
-            raise RuntimeError('Хранилище ключей поддерживается только в Windows')
+        if os.name != 'nt' or os.environ.get('HH_DATABASE_URL'):
+            import hashlib
+            from cryptography.fernet import Fernet
+            secret=os.environ.get('HH_MASTER_KEY','')
+            if len(secret)<32:
+                raise RuntimeError('Для серверного хранилища нужен HH_MASTER_KEY длиной от 32 символов')
+            cipher=Fernet(base64.urlsafe_b64encode(hashlib.sha256(secret.encode()).digest()))
+            return cipher.decrypt(data) if decrypt else cipher.encrypt(data)
         from ctypes import wintypes
         class Blob(ctypes.Structure):
             _fields_ = [('cbData', wintypes.DWORD),('pbData',ctypes.POINTER(ctypes.c_ubyte))]
@@ -169,6 +196,11 @@ class Vault:
 
     def read(self):
         with self.lock:
+            if os.environ.get('HH_DATABASE_URL'):
+                from pg_store import connect
+                with connect() as db:
+                    row=db.execute("SELECT body FROM documents WHERE name='encrypted_secrets'").fetchone()
+                return json.loads(self.crypt(row[0].encode(),True)) if row else {}
             if not self.path.exists():
                 return {}
             return json.loads(self.crypt(self.path.read_bytes(),True))
@@ -178,6 +210,11 @@ class Vault:
             current = self.read()
             current.update(values)
             blob = self.crypt(json.dumps(current).encode())
+            if os.environ.get('HH_DATABASE_URL'):
+                from pg_store import connect
+                with connect() as db:
+                    db.execute("INSERT OR REPLACE INTO documents VALUES ('encrypted_secrets',?)",(blob.decode(),))
+                return
             temp = self.path.with_suffix('.tmp')
             temp.write_bytes(blob)
             os.replace(temp,self.path)
@@ -204,9 +241,12 @@ class HH:
     def request(self, path, params=None, method='GET', payload=None, auth=False, form=False):
         if not path.startswith('/') or path.startswith('//'):
             raise ValueError('Неверный путь API')
-        headers = {'User-Agent':self.store.settings()['user_agent'], 'Accept':'application/json'}
+        agent=self.store.settings()['user_agent']
+        if os.environ.get('HH_CONTACT_EMAIL'):
+            agent+=' ('+os.environ['HH_CONTACT_EMAIL']+')'
+        headers = {'User-Agent':agent,'HH-User-Agent':agent, 'Accept':'application/json'}
         if auth:
-            headers['Authorization'] = 'Bearer '+self.token()
+            headers['Authorization'] = 'Bearer '+(self.application_token() if auth=='application' else self.token())
         url = 'https://api.hh.ru'+path
         if params:
             url += '?'+urllib.parse.urlencode(params,doseq=True)
@@ -226,6 +266,20 @@ class HH:
         except (urllib.error.URLError, TimeoutError):
             raise HHError(0,'сеть недоступна или истекло время ожидания; результат отправки может быть неизвестен') from None
 
+    def application_token(self):
+        with self.lock:
+            saved=self.vault.read()
+            if saved.get('app_access_token') and (not saved.get('app_expires_at') or saved['app_expires_at']>time.time()+90):
+                return saved['app_access_token']
+            result=self.request('/token',method='POST',form=True,payload={
+                'grant_type':'client_credentials','client_id':saved['api_client_id'],
+                'client_secret':saved['client_secret']})
+            if not result.get('access_token'):
+                raise ValueError('hh.ru не вернул токен приложения')
+            self.vault.update(app_access_token=result['access_token'],
+                              app_expires_at=time.time()+int(result['expires_in']) if result.get('expires_in') else 0)
+            return result['access_token']
+
     def token(self):
         with self.lock:
             sec = self.vault.read()
@@ -237,7 +291,7 @@ class HH:
                 raise ValueError('Требуется повторная авторизация hh.ru')
             result = self.request('/token',method='POST',payload={
                 'grant_type':'refresh_token','refresh_token':sec['refresh_token'],
-                'client_id':self.store.settings()['client_id'],'client_secret':sec.get('client_secret','')},form=True)
+                'client_id':sec['api_client_id'],'client_secret':sec.get('client_secret','')},form=True)
             self.save_tokens(result)
             return result['access_token']
 
@@ -270,8 +324,8 @@ def evaluate(v, settings):
     if re.search(r'маркетинг|инвестиц|финансов|продаж|кредитн|товарн|закуп',name) and not re.search(r'бизнес|системн|данных|\bbi\b',name):
         return 20,'Смежная специализация: требуется оценка вручную'
     experience=(v.get('experience') or {}).get('id')
-    if experience!='noExperience':
-        return 0,'Только вакансии «Без опыта»: опыт требуется или не указан однозначно'
+    if experience not in ('noExperience','between1And3'):
+        return 0,'Допустимы «Без опыта» и «1–3 года»'
     area=str((v.get('area') or {}).get('id',''))
     remote=any(x.get('id')=='REMOTE' for x in v.get('work_format',[])) or (v.get('schedule') or {}).get('id')=='remote'
     if area!='1' and not remote:
@@ -307,7 +361,7 @@ def evaluate(v, settings):
     score=55
     if re.search(r'бизнес|системн|business|system',name):
         score+=15; reasons.append('Основное направление')
-    score+=15; reasons.append('Без опыта работы')
+    score+=15; reasons.append('Без опыта работы' if experience=='noExperience' else 'Опыт 1–3 года')
     matches=sum(bool(re.search(p,desc)) for p in [r'\bsql\b',r'\bpython\b',r'power\s*bi',r'excel',r'бизнес.процесс',r'требован'])
     score+=min(matches*3,15)
     if not matches:
@@ -320,18 +374,69 @@ def evaluate(v, settings):
 
 
 def letter_for(v):
-    text=clean(v.get('description') or json.dumps(v.get('snippet',{}),ensure_ascii=False)).lower()
-    entries=[]
-    triggers={'SQL':r'\bsql\b','Python':r'\bpython\b','Power BI':r'power\s*bi','Excel':r'excel','бизнес-анализ':r'бизнес|требован|процесс|документац'}
-    for key,pattern in triggers.items():
-        if re.search(pattern,text):
-            entries.append(f'{key}: {PROFILE["skills"][key]}')
-    focus='; '.join(entries[:3]) if entries else 'SQL, Python, Power BI и Excel, описание бизнес-процессов и структурирование требований'
-    return (f'Здравствуйте! Меня заинтересовала вакансия «{clean(v.get("name"))}» в компании «{clean((v.get("employer") or {}).get("name"))}».\n\n'
-            f'{PROFILE["education"]}\nВладею следующими навыками: {focus}.\n'
-            f'{PROFILE["project"]}\n\n'
-            'Рассматриваю стартовую позицию в аналитике и готов развиваться в задачах вашей команды. '
-            f'{PROFILE["start"]} Буду рад обсудить вакансию.\n\nС уважением, {PROFILE["name"]}')
+    description=v.get('description') or json.dumps(v.get('snippet',{}),ensure_ascii=False)
+    text=clean(re.sub(r'</(?:p|li|h[1-6])>', '\n',description,flags=re.I)).lower()
+    duties=re.search(r'(?:обязанности|задачи|чем предстоит заниматься|тебе предстоит|вам предстоит)\s*:',text)
+    if duties:
+        text=text[duties.end():]
+        text=re.split(r'\n\s*(?:условия|мы предлагаем|что предлагаем|что мы предлагаем)\s*:',text,maxsplit=1)[0]
+    snippets=PROFILE.get('cover_letter',{})
+    matches=[]
+    known_skills=json.dumps(PROFILE['skills'],ensure_ascii=False).lower()
+    tasks=[]
+    for key,pattern,phrase,evidence_key in (
+        ('бизнес-анализ',r'(?:сбор|анализ|уточн|формализ|проработ|разработ|декомпоз)[^\n.]{0,60}требован|бизнес.требован',
+         'сборе и формализации требований','requirements'),
+        ('BPMN / IDEF0 / IDEF2 / UML',r'(?:описан|моделир|обследован)[^\n.]{0,50}процесс|\bbpmn\b|\bidef[02]\b',
+         'описании и моделировании бизнес-процессов','requirements'),
+        ('бизнес-анализ',r'техническ[^\n.]{0,30}(?:документ|задан)|аналитическ[^\n.]{0,25}документ|пользовательск[^\n.]{0,20}сценари',
+         'подготовке технической документации и пользовательских сценариев','requirements'),
+        ('SQL',r'\bsql\b|анализ[^\n.]{0,30}данных|модел[^\n.]{0,20}данных',
+         'анализе данных','integration'),
+        ('API',r'\bapi\b|интеграц',
+         'интеграции систем через API','integration'),
+        ('Аналитика и метрики',r'\bkpi\b|\broi\b|retention|churn|удержан|отток|анализ[^\n.]{0,30}метрик|рекламн[^\n.]{0,30}(?:канал|размещ)',
+         'анализе метрик и эффективности решений','metrics'),
+        ('AI / LLM',r'\bai\b|\bllm\b|нейросет|ии.агент',
+         'автоматизации с помощью Python и AI-агентов','automation'),
+    ):
+        match=re.search(pattern,text)
+        if key in PROFILE['skills'] and match:
+            tasks.append((match.start(),phrase,evidence_key))
+    tasks.sort(key=lambda task:task[0])
+    selected_tasks=tasks[:2]
+    relevance=''
+    if selected_tasks:
+        relevance='Могу быть полезен в '+', а также в '.join(task[1] for task in selected_tasks)+'. '
+    for key,pattern in (
+        ('SQL',r'\bsql\b'),('Python',r'\bpython\b'),('API',r'\bapi\b'),
+        ('BPMN',r'\bbpmn\b'),('UML',r'\buml\b'),('IDEF0',r'\bidef0\b'),
+        ('IDEF2',r'\bidef2\b'),('Confluence',r'confluence'),('Power BI',r'power\s*bi'),
+    ):
+        if key.lower() in known_skills and re.search(pattern,text):
+            matches.append(key)
+    skills='В работе использую '+', '.join(matches[:3])+'. ' if matches else ''
+    if not selected_tasks and not skills:
+        relevance='Работаю со сбором и формализацией требований, описанием процессов и технической документацией. '
+    evidence_key=selected_tasks[0][2] if selected_tasks else 'requirements'
+    for preferred in ('metrics','automation'):
+        if any(task[2]==preferred for task in selected_tasks):
+            evidence_key=preferred
+            break
+    evidence=snippets.get(evidence_key,PROFILE['project'])
+    if not selected_tasks and re.search(r'\bai\b|\bllm\b|автоматизац|нейросет',text):
+        evidence=snippets.get('automation',PROFILE['project'])
+    elif not selected_tasks and re.search(r'\bkpi\b|\broi\b|retention|churn|удержан|маркетинг',text):
+        evidence=snippets.get('metrics',PROFILE['project'])
+    elif not selected_tasks and re.search(r'интеграц|\bapi\b|\bpython\b|cad|сапр',text):
+        evidence=snippets.get('integration',PROFILE['project'])
+    company=clean((v.get('employer') or {}).get('name'))
+    destination=f' в «{company}»' if company else ''
+    return (f'Здравствуйте! Откликаюсь на вакансию «{clean(v.get("name"))}»{destination}.\n\n'
+            f'{snippets.get("intro",PROFILE.get("coordination",""))}\n\n'
+            f'{relevance}{skills}{evidence}\n\n'
+            f'{snippets.get("closing","Буду рад обсудить задачи на собеседовании.")}\n'
+            f'Тимур Хабибуллин')
 
 
 def hr_decision(messages, settings):
@@ -369,7 +474,8 @@ def hr_decision(messages, settings):
 
 
 class BrowserBridge:
-    def __init__(self):
+    def __init__(self,vault=None):
+        self.vault=vault
         self.proc=None
         self.lock=threading.Lock()
 
@@ -381,26 +487,39 @@ class BrowserBridge:
                 flags = subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0
                 runtime_path=ROOT/'runtime.json'
                 runtime=json.loads(runtime_path.read_text(encoding='utf-8')) if runtime_path.exists() else {}
-                node=runtime.get('node') or shutil.which('node')
+                node=(runtime.get('node') if os.name=='nt' else None) or shutil.which('node')
                 if node and not Path(node).is_absolute():
                     node=str(ROOT/node)
                 if not node or not Path(node).exists():
                     raise ValueError('Node.js не найден. Запусти Установить.cmd')
+                child_env=os.environ.copy()
+                if self.vault and os.environ.get('HH_DATABASE_URL'):
+                    state=self.vault.read().get('browser_state')
+                    if state:
+                        child_env['HH_BROWSER_STATE']=json.dumps(state)
                 self.proc=subprocess.Popen([node,str(ROOT/'browser.cjs')],cwd=ROOT,stdin=subprocess.PIPE,
-                                           stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,encoding='utf-8',creationflags=flags)
+                                           stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,encoding='utf-8',creationflags=flags,env=child_env)
             self.proc.stdin.write(json.dumps(command,ensure_ascii=False)+'\n')
             self.proc.stdin.flush()
             line=self.proc.stdout.readline()
             if not line:
                 raise ValueError('Браузерный модуль завершился. Открой вход заново.')
-            return json.loads(line)
+            result=json.loads(line)
+            if self.vault and os.environ.get('HH_DATABASE_URL') and command.get('action')!='close':
+                self.proc.stdin.write(json.dumps({'action':'export_session'})+'\n');self.proc.stdin.flush()
+                state=json.loads(self.proc.stdout.readline())
+                if state.get('browser_state'):
+                    self.vault.update(browser_state=state['browser_state'])
+            return result
 
 
 class Engine:
     def __init__(self, store, vault):
         self.store,self.vault=store,vault
         self.hh=HH(store,vault)
-        self.browser=BrowserBridge()
+        self.reply_model=ReplyModel(store,vault)
+        self.model_working=False
+        self.browser=BrowserBridge(vault)
         self.lock=threading.Lock()
         self.wake=threading.Event()
         self.last_search=0
@@ -409,7 +528,55 @@ class Engine:
         self.last_chats=0
         self.activity=''
         self.port=8765
+        self.oauth_pending={}
+        self.oauth_lock=threading.Lock()
+        saved_api=self.vault.read()
+        self.api_status={'connected':bool(saved_api.get('access_token')),
+                         'detail':'API сохранён. Проверка доступа выполняется при запросе.' if saved_api.get('api_client_id') else 'Авторизация API ещё не выполнена.'}
         self.browser_reads=False
+        self.captcha_vacancy=None
+        self.next_auto_application=0
+
+    def start_oauth(self, client_id, client_secret):
+        for value in (client_id,client_secret):
+            if not isinstance(value,str) or not re.fullmatch(r'[A-Za-z0-9_-]{10,200}',value):
+                raise ValueError('Скопируй Client ID и Client Secret из одобренной заявки.')
+        self.vault.update(api_client_id=client_id,client_secret=client_secret)
+        state=secrets.token_urlsafe(32)
+        with self.oauth_lock:
+            self.oauth_pending={state:time.monotonic()+600}
+        return 'https://hh.ru/oauth/authorize?'+urllib.parse.urlencode({
+            'response_type':'code','client_id':client_id,'state':state,
+            'redirect_uri':(os.environ.get('HH_PUBLIC_ORIGIN') or os.environ.get('RENDER_EXTERNAL_URL') or f'http://127.0.0.1:{self.port}')+'/oauth/callback'})
+
+    def finish_oauth(self, query):
+        state=query.get('state',[''])[0]
+        with self.oauth_lock:
+            expires=self.oauth_pending.pop(state,0)
+        if expires<time.monotonic():
+            raise ValueError('Ссылка авторизации истекла или уже использована. Подключи API заново.')
+        if query.get('error'):
+            raise ValueError('hh.ru не предоставил доступ. Авторизацию можно повторить.')
+        code=query.get('code',[''])[0]
+        if not code:
+            raise ValueError('hh.ru не передал код авторизации.')
+        credentials=self.vault.read()
+        tokens=self.hh.request('/token',method='POST',form=True,payload={
+            'grant_type':'authorization_code','code':code,
+            'client_id':credentials['api_client_id'],'client_secret':credentials['client_secret'],
+            'redirect_uri':(os.environ.get('HH_PUBLIC_ORIGIN') or os.environ.get('RENDER_EXTERNAL_URL') or f'http://127.0.0.1:{self.port}')+'/oauth/callback'})
+        self.hh.save_tokens(tokens)
+        self.hh.request('/me',auth=True)
+        self.api_status={'connected':True,'detail':'OAuth выполнен. Проверка методов соискателя ещё не завершена.'}
+        try:
+            self.hh.request('/resumes/mine',auth=True)
+            self.api_status['detail']='OAuth выполнен. API разрешает чтение резюме соискателя.'
+        except HHError:
+            self.api_status['detail']='OAuth выполнен. Чтение резюме соискателя через API недоступно.'
+        self.hh.request('/vacancies',params={'per_page':1},auth='application')
+        self.api_status['detail']+=' Поиск вакансий через API приложения доступен.'
+        self.store.event('api',self.api_status['detail'])
+        return self.api_status['detail']
 
     def browser_result(self, command):
         result=self.browser.call(command)
@@ -425,6 +592,14 @@ class Engine:
         return self.browser_status
 
     def read_vacancies(self, path, params=None, brief=None):
+        if self.vault.read().get('api_client_id'):
+            try:
+                return self.hh.request(path,params=params,auth='application')
+            except HHError as error:
+                if error.code not in (0,500,502,503,504):
+                    raise
+                time.sleep(2)
+                return self.hh.request(path,params=params,auth='application')
         command={'action':'search','params':params} if path=='/vacancies' else {'action':'detail','id':path.split('/')[-1],'brief':brief or {}}
         return self.browser_result(command)
 
@@ -432,17 +607,19 @@ class Engine:
         command={'action':'chats'} if path=='/common/chats' else {'action':'chat','chat_id':path.split('/')[-2]}
         return self.browser_result(command)
 
-    def search(self):
+    def search(self, dispatch=False):
         settings=self.store.settings()
         self.activity='Подбор вакансий'
         seen=set()
         count=0
         for query in settings['queries']:
             # Two independent scopes: Moscow all formats + remote across Russia.
-            for scope in ({'area':'1'},{'area':'113','work_format':'REMOTE'}):
-                for page in range(2):
-                    result=self.read_vacancies('/vacancies',params={'text':query,'search_field':'name','experience':'noExperience','per_page':50,
-                                         'page':page,'order_by':'publication_time','period':7,**scope})
+            for scope in ({**location,'experience':experience}
+                          for experience in ('noExperience','between1And3')
+                          for location in ({'area':'1'},{'area':'113','work_format':'REMOTE'})):
+                for page in range(10):
+                    result=self.read_vacancies('/vacancies',params={'text':query,'search_field':'name','per_page':50,
+                                         'page':page,'order_by':'publication_time','period':30,**scope})
                     for brief in result.get('items',[]):
                         vid=str(brief['id'])
                         if vid in seen:
@@ -454,7 +631,12 @@ class Engine:
                             continue
                         # Detail contains actual requirements, not just search snippets.
                         preliminary,_=evaluate(brief,settings)
-                        vacancy=self.read_vacancies('/vacancies/'+urllib.parse.quote(vid,safe=''),brief=brief) if preliminary>=40 else brief
+                        try:
+                            vacancy=self.read_vacancies('/vacancies/'+urllib.parse.quote(vid,safe=''),brief=brief) if preliminary>=40 else brief
+                        except HHError as error:
+                            if error.code!=404:
+                                raise
+                            vacancy={**brief,'archived':True}
                         score,reason=evaluate(vacancy,settings)
                         status='new' if score>=40 else 'filtered'
                         with self.store.connect() as db:
@@ -463,6 +645,11 @@ class Engine:
                               letter=excluded.letter,status=excluded.status,updated=excluded.updated''',
                               (vid,json.dumps(vacancy,ensure_ascii=False),score,reason,letter_for(vacancy),status,now()))
                         count+=1
+                    if dispatch and self.pending_application_count():
+                        self.apply_pending()
+                        if self.captcha_vacancy:
+                            return count
+                        self.activity='Подбор вакансий'
                     if page+1>=result.get('pages',1):
                         break
         self.last_search=time.time()
@@ -496,17 +683,25 @@ class Engine:
             else:
                 self.activity='Отправка отклика'
                 submission_started=True
-                result=self.browser.call({'action':'apply','id':vid,'resume_id':settings['resume_id'],'letter':row['letter'],
+                result=self.browser.call({'action':'apply','id':vid,'resume_id':settings['resume_id'],'letter':letter_for(live),
                                           'preferences':{'min_salary':settings['min_salary'],'target_salary':settings['target_salary']}})
         except Exception as error:
             # Includes lost IPC after browser click: cannot know whether submitted.
+            transient_preflight = not submission_started and ((isinstance(error,HHError) and error.code in (0,404,500,502,503,504)) or bool(re.search(
+                r'net::ERR_(?:SSL_PROTOCOL_ERROR|CONNECTION_RESET|TIMED_OUT|CONNECTION_CLOSED)',
+                str(error),
+            )))
             result={'status':'uncertain' if submission_started else 'attention',
+                    'pause_required':not transient_preflight,
                     'detail':('Результат отправки неизвестен. Проверь hh.ru перед повтором. ' if submission_started else 'Не завершена проверка вакансии; отправка не начиналась. ')+str(error).split('\n')[0]}
         with self.store.connect() as db:
             db.execute('UPDATE vacancies SET status=?,updated=? WHERE id=?',(result['status'],now(),vid))
             if result['status']=='applied' and result.get('chat_id'):
                 chat={'id':str(result['chat_id']),'vacancy_id':vid,'scope':'assistant','type':'NEGOTIATION'}
                 db.execute('INSERT OR REPLACE INTO chats VALUES (?,?,?)',(chat['id'],json.dumps(chat),now()))
+        if result.get('captcha'):
+            self.captcha_vacancy=vid
+            self.store.event('pause', 'Поиск, чаты и отклики ждут прохождения капчи.')
         self.store.event('apply',f'{vid}: {result["detail"]}')
         for answer in result.get('answers',[]):
             self.store.event('questionnaire',f'{vid}: {answer["question"]} → {answer["answer"]}')
@@ -546,6 +741,83 @@ class Engine:
             if uncertain:
                 self.store.task('delivery',key,'Проверь доставку сообщения',f'Чат {chat_id}. Результат отправки неизвестен; автоматического повтора нет. Текст: {text}')
             raise
+
+    def queue_hr_review(self, chat, messages, settings, gap=False, allowed=True, refresh_model=False):
+        cid=str(chat['id'])
+        messages=sorted(messages,key=lambda m:int(m['id']) if str(m['id']).isdigit() else 0)
+        last_self=max((i for i,m in enumerate(messages) if m.get('sender_display_info',{}).get('is_current_participant') is True),default=-1)
+        tail=[m for m in messages[last_self+1:] if m.get('sender_display_info',{}).get('role')=='EMPLOYER']
+        review=draft_reply(tail,PROFILE,settings)
+        resume_text=self.store.resume_context()
+        model_profile={'resume_text':resume_text,'start':PROFILE['start'],'formats':PROFILE['formats']} if resume_text else PROFILE
+        with self.store.connect() as db:
+            row=db.execute('SELECT body FROM vacancies WHERE id=?',(str(chat.get('vacancy_id','')),)).fetchone()
+        vacancy=json.loads(row[0]) if row else {}
+        if tail:
+            try:
+                used, generated=self.reply_model.review(messages,model_profile,settings,vacancy,refresh=refresh_model)
+                if used:
+                    review=generated
+                elif review:
+                    review['source']='rules'
+            except ModelError as error:
+                self.reply_model.error=str(error)
+                if review:
+                    review['missing'].insert(0,'API модели недоступен: показан запасной черновик. '+str(error))
+                    review['source']='rules'
+        else:
+            review=None
+        with self.store.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            existing=db.execute("SELECT * FROM tasks WHERE ref LIKE ? AND kind IN ('question','interview','test') AND status='open' ORDER BY id DESC",(cid+':%',)).fetchall()
+            if not review:
+                db.execute("UPDATE tasks SET status='done' WHERE ref LIKE ? AND kind IN ('question','interview','test') AND status='open'",(cid+':%',))
+                return
+            ref=cid+':'+str(tail[-1]['id'])
+            handled=db.execute("SELECT 1 FROM tasks WHERE ref=? AND kind IN ('question','interview','test') AND status IN ('done','sending','uncertain')",(ref,)).fetchone()
+            if handled:
+                for old in existing:
+                    db.execute("UPDATE tasks SET status='done' WHERE id=?",(old['id'],))
+                return
+            vacancy=db.execute('SELECT body FROM vacancies WHERE id=?',(str(chat.get('vacancy_id','')),)).fetchone()
+            vacancy=json.loads(vacancy[0]) if vacancy else {}
+            review.update(chat_id=cid,source_ref=ref,vacancy_id=str(chat.get('vacancy_id','')),
+                          vacancy_title=vacancy.get('name') or (chat.get('display') or {}).get('title') or 'Вопрос по вакансии',
+                          employer=(vacancy.get('employer') or {}).get('name',''),
+                          checked_at=chat.get('checked_at'),can_send=allowed,last_message_id=str(messages[-1]['id']),
+                          messages=[{'id':str(m['id']),'role':m.get('sender_display_info',{}).get('role'),
+                                     'text':message_text(m),'at':m.get('creation_time',''),
+                                     'attachments':m.get('payload',{}).get('attachments') or []}
+                                    for m in messages[-12:] if m.get('sender_display_info',{}).get('role') in ('APPLICANT','EMPLOYER')])
+            if gap:
+                review['missing'].append('В истории есть разрыв. Проверь контекст переписки.')
+            title='Обновился контекст: проверь переписку' if gap else review['vacancy_title']
+            if existing:
+                task_id=next((old['id'] for old in existing if old['ref']==ref),existing[0]['id'])
+                db.execute("UPDATE tasks SET kind='question',ref=?,title=?,body=?,draft=? WHERE id=?",(ref,title,review['body'],review['draft'],task_id))
+                for old in existing:
+                    if old['id']!=task_id:
+                        db.execute("UPDATE tasks SET status='done' WHERE id=?",(old['id'],))
+            else:
+                db.execute("INSERT INTO tasks(kind,ref,title,body,draft,created) VALUES ('question',?,?,?,?,?)",(ref,title,review['body'],review['draft'],now()))
+                task_id=db.execute('SELECT last_insert_rowid()').fetchone()[0]
+            db.execute('INSERT OR REPLACE INTO hr_reviews VALUES (?,?)',(task_id,json.dumps(review,ensure_ascii=False)))
+
+    def rebuild_hr_reviews(self, refresh_model=False, existing_only=False):
+        with self.store.connect() as db:
+            chats=[dict(row) for row in db.execute('SELECT * FROM chats')]
+            selected={row[0].split(':')[0] for row in db.execute("SELECT ref FROM tasks WHERE status='open' AND kind IN ('question','interview','test')")} if existing_only else None
+        owned=self.owned_vacancies()
+        for row in chats:
+            if selected is not None and row['id'] not in selected:
+                continue
+            chat=json.loads(row['body'])
+            if str(chat.get('vacancy_id','')) not in owned:
+                continue
+            chat['id']=row['id']
+            with self.store.connect() as db:
+                messages=[json.loads(m[0]) for m in db.execute('SELECT body FROM messages WHERE chat_id=? ORDER BY CAST(id AS INTEGER) DESC LIMIT 200',(row['id'],))]
+            self.queue_hr_review(chat,messages,self.store.settings(),refresh_model=refresh_model)
 
     def owned_vacancies(self):
         with self.store.connect() as db:
@@ -610,7 +882,7 @@ class Engine:
                 if failed_chat:
                     continue
                 vacancy_id=str(history.get('vacancy_id') or '')
-                chat={**chat,'vacancy_id':vacancy_id,'scope':'assistant' if vacancy_id in owned else 'external'}
+                chat={**chat,'vacancy_id':vacancy_id,'checked_at':now(),'scope':'assistant' if vacancy_id in owned else 'external'}
                 if vacancy_id not in owned:
                     with self.store.connect() as db:
                         db.execute('INSERT OR REPLACE INTO chats VALUES (?,?,?)',(cid,json.dumps(chat,ensure_ascii=False),known[0] if known else now()))
@@ -642,45 +914,12 @@ class Engine:
                 last_self=max((i for i,m in enumerate(messages) if m.get('sender_display_info',{}).get('is_current_participant') is True),default=-1)
                 tail_ids={str(m['id']) for m in messages[last_self+1:]}
                 incoming=[m for m in incoming if str(m['id']) in tail_ids]
-                full_tail=[m for m in messages[last_self+1:] if m.get('sender_display_info',{}).get('role')=='EMPLOYER']
-                if full_tail:
-                    existing_kind,_,existing_draft=hr_decision(full_tail,settings)
-                    body='\n\n'.join((m.get('payload',{}).get('text') or '')+
-                                     ''.join('\nВложение или ссылка: '+str(a.get('title','Файл')) for a in m.get('payload',{}).get('attachments') or []) for m in full_tail)
-                    with self.store.connect() as db:
-                        if existing_kind=='info':
-                            db.execute("UPDATE tasks SET status='done' WHERE ref LIKE ? AND status='open' AND title='Первое подключение: проверь переписку'",(cid+':%',))
-                        else:
-                            db.execute("UPDATE tasks SET body=?,draft=? WHERE ref LIKE ? AND status='open' AND title='Первое подключение: проверь переписку'",(body,existing_draft,cid+':%'))
                 with self.store.connect() as db:
                     db.execute("UPDATE tasks SET status='done' WHERE kind='history' AND ref=? AND status='open'",(cid,))
-                with self.store.connect() as db:
                     db.execute('INSERT OR REPLACE INTO chats VALUES (?,?,?)',(cid,json.dumps(chat,ensure_ascii=False),known[0] if known else now()))
-                if not incoming:
-                    continue
-                count+=len(incoming)
-                text='\n\n'.join((m.get('payload',{}).get('text') or '')+
-                                 ''.join('\nВложение: '+str(a.get('title','Файл')) for a in m.get('payload',{}).get('attachments') or [])
-                                 for m in incoming)
-                kind,title,draft=hr_decision(incoming,settings)
-                if kind=='info':
-                    continue
-                ref=cid+':'+str(incoming[-1]['id'])
-                # Existing backlog is queued for review instead of replying to stale messages.
                 allowed=history.get('chat_states',{}).get('write_message_state',{}).get('allowed') is True
-                with self.store.connect() as db:
-                    pending=db.execute("SELECT 1 FROM tasks WHERE ref LIKE ? AND status IN ('open','sending','uncertain') AND kind IN ('interview','test','question','salary','start','format')",(cid+':%',)).fetchone()
-                    uncertain_delivery=db.execute("SELECT 1 FROM outbox WHERE chat_id=? AND status IN ('sending','uncertain')",(cid,)).fetchone()
-                current=self.store.settings()
-                if not gap and kind=='auto' and current['enabled'] and current['auto_reply'] and allowed and not pending and not uncertain_delivery:
-                    try:
-                        self.send(cid,draft)
-                    except Exception:
-                        self.store.task('question',ref,'Автоответ не отправлен',text,draft)
-                        raise
-                else:
-                    self.store.task(kind if kind!='auto' else 'question',ref,
-                                    ('Обновился контекст: проверь переписку' if gap else title),text,draft)
+                self.queue_hr_review(chat,messages,settings,gap=gap,allowed=allowed,refresh_model=True)
+                count+=len(incoming)
             if page+1>=result.get('pages',1):
                 break
         self.last_chats=time.time()
@@ -693,7 +932,7 @@ class Engine:
         self.store.event('chats',f'Новых входящих сообщений: {count}')
         return count
 
-    def resolve_task(self, task_id, text='', dismiss=False):
+    def resolve_task(self, task_id, text='', dismiss=False, expected_ref=None):
         with self.store.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             task=db.execute('SELECT * FROM tasks WHERE id=?',(task_id,)).fetchone()
@@ -710,6 +949,16 @@ class Engine:
                 raise ValueError('Задача уже обработана; проверь историю')
             if task['kind'] not in ('interview','test','question'):
                 raise ValueError('Эту задачу нужно проверить в hh.ru и отметить решённой')
+            if expected_ref is not None and task['ref']!=expected_ref:
+                raise ValueError('HR написал новое сообщение. Обнови карточку и проверь черновик.')
+            if re.search(r'\[(?:укажи|проверь|дополни|напиши)[^\]]*\]',text,re.I):
+                raise ValueError('Заполни отмеченные места в черновике перед отправкой.')
+            context=db.execute('SELECT body FROM hr_reviews WHERE task_id=?',(task_id,)).fetchone()
+            if context:
+                context=json.loads(context[0])
+                latest=db.execute('SELECT id FROM messages WHERE chat_id=? ORDER BY CAST(id AS INTEGER) DESC LIMIT 1',(task['ref'].split(':')[0],)).fetchone()
+                if not latest or latest[0]!=context['last_message_id']:
+                    raise ValueError('Переписка обновилась. Проверь последние сообщения перед отправкой.')
             db.execute("UPDATE tasks SET status='sending' WHERE id=?",(task_id,))
         try:
             self.send(task['ref'].split(':')[0],text,automated=False)
@@ -741,30 +990,48 @@ class Engine:
             settings=self.store.settings()
             if not settings['enabled'] or not settings['auto_apply']:
                 break
+            while time.monotonic()<self.next_auto_application:
+                self.activity='Пауза между откликами'
+                self.wake.wait(max(0,self.next_auto_application-time.monotonic()))
+                self.wake.clear()
+                settings=self.store.settings()
+                if not settings['enabled'] or not settings['auto_apply']:
+                    return attempted
             outcome=self.apply_one(row['id'])
+            if outcome['status'] in ('applied','uncertain'):
+                self.next_auto_application=time.monotonic()+120
             attempted+=1
+            if self.captcha_vacancy:
+                break
             if outcome['status'] in ('attention','uncertain','error') and outcome.get('pause_required',True):
                 self.store.event('pause','Автоотклики остановлены до проверки браузера. Сними паузу после решения задачи.')
                 self.store.save_settings({'auto_apply':False})
                 break
-            if attempted<len(rows):
-                self.activity='Пауза между откликами'
-                self.wake.wait(30 if outcome['status']=='applied' else 5)
-                self.wake.clear()
         return attempted
 
-    def cycle(self, search_only=False, search_due=True, chat_due=True):
+    def cycle(self, search_only=False, search_due=True, chat_due=True, dispatch=False):
         if not self.lock.acquire(blocking=False):
             raise ValueError('Операция уже выполняется')
         self.running=True
         try:
+            if self.captcha_vacancy:
+                return
             settings=self.store.settings()
             if search_only:
-                self.search()
+                if dispatch:
+                    self.store.save_settings({'enabled':True,'auto_apply':True})
+                    self.last_search=0
+                    if self.apply_pending():
+                        return
+                    self.search(dispatch=True)
+                else:
+                    self.search()
                 return
             # A populated queue must not wait behind a complete vacancy crawl.
             # Small batches leave checkpoints for chat monitoring and manual actions.
             attempted=self.apply_pending()
+            if self.captcha_vacancy:
+                return
             if chat_due and (settings['resume_id'] or self.browser_status.get('logged_in')):
                 try:
                     self.sync_chats()
@@ -775,20 +1042,48 @@ class Engine:
                 self.last_chats=time.time()
             if attempted or not search_due:
                 return
-            self.search()
-            self.apply_pending()
+            self.search(dispatch=True)
+            if not self.captcha_vacancy:
+                self.apply_pending()
         finally:
             self.running=False
             self.activity=''
             self.lock.release()
 
+    def check_captcha(self):
+        with self.lock:
+            vid=self.captcha_vacancy
+            if not vid:
+                return
+            result=self.browser.call({'action':'captcha_status'})
+            if result['status']=='applied':
+                with self.store.connect() as db:
+                    db.execute("UPDATE vacancies SET status='applied',updated=? WHERE id=? AND status='uncertain'",(now(),vid))
+                    db.execute("UPDATE tasks SET status='done' WHERE kind='application' AND ref=? AND status='open'",(vid,))
+                self.next_auto_application=time.monotonic()+120
+                self.store.event('apply',f'{vid}: hh.ru подтвердил отклик после капчи.')
+            elif result['status']=='closed':
+                self.store.save_settings({'auto_apply':False})
+                self.store.event('pause','Вкладка проверки закрыта. Проверь отклик на hh.ru и включи автоотклики вручную.')
+            else:
+                return
+            self.captcha_vacancy=None
+
     def loop(self):
         while True:
+            if self.captcha_vacancy:
+                try:
+                    self.check_captcha()
+                except Exception as error:
+                    self.store.event('error',str(error))
+                self.wake.wait(5)
+                self.wake.clear()
+                continue
             settings=self.store.settings()
             search_due=time.time()-self.last_search>=settings['interval_minutes']*60
             chat_due=time.time()-self.last_chats>=settings['chat_interval_minutes']*60
             applications_due=self.pending_application_count()>0
-            if settings['enabled'] and (applications_due or search_due or chat_due):
+            if settings['enabled'] and not self.lock.locked() and (applications_due or search_due or chat_due):
                 try:
                     self.cycle(search_due=search_due,chat_due=chat_due)
                 except Exception as e:
@@ -806,7 +1101,20 @@ def make_handler(engine):
             pass  # OAuth code and other secrets must not enter access logs.
 
         def trusted(self):
-            return self.headers.get('Host') in (f'127.0.0.1:{engine.port}', f'localhost:{engine.port}')
+            return self.headers.get('Host') in (f'127.0.0.1:{engine.port}', f'localhost:{engine.port}',urllib.parse.urlparse(os.environ.get('HH_PUBLIC_ORIGIN') or os.environ.get('RENDER_EXTERNAL_URL','')).netloc or '_invalid_')
+
+        def authenticated(self):
+            password=os.environ.get('HH_ACCESS_PASSWORD','')
+            if not password:
+                return True
+            expected='Basic '+base64.b64encode(('timur:'+password).encode()).decode()
+            if secrets.compare_digest(self.headers.get('Authorization',''),expected):
+                return True
+            self.send_response(401)
+            self.send_header('WWW-Authenticate','Basic realm="Personal assistant"')
+            self.send_header('Content-Length','0')
+            self.end_headers()
+            return False
 
         def respond(self,status,body,kind='application/json; charset=utf-8'):
             if not isinstance(body,bytes):
@@ -822,6 +1130,10 @@ def make_handler(engine):
             self.wfile.write(body)
 
         def do_GET(self):
+            if self.path=='/healthz':
+                return self.respond(200,{'ok':True})
+            if not self.authenticated():
+                return
             if not self.trusted():
                 return self.respond(403,{'error':'Недопустимый Host'})
             parsed=urllib.parse.urlparse(self.path)
@@ -833,18 +1145,31 @@ def make_handler(engine):
                     return self.respond(200,(ROOT/route[1:]).read_bytes(),'text/javascript; charset=utf-8' if route.endswith('js') else 'text/css; charset=utf-8')
                 if route=='/api/state':
                     state=engine.store.snapshot()
-                    state.update(csrf=csrf,running=engine.running,connected=bool(engine.browser_status.get('logged_in')),
-                                 browser=engine.browser_status,activity=engine.activity,connection_mode='browser',version='0.2')
+                    state['alerts']=[task for task in state['tasks'] if not task.get('review')]
+                    state['tasks']=[task for task in state['tasks'] if task.get('review')]
+                    with engine.store.connect() as db:
+                        state['counts']={'suitable':db.execute("SELECT COUNT(*) FROM vacancies WHERE score>=60 AND status NOT IN ('filtered','dismissed')").fetchone()[0], 'applied':db.execute("SELECT COUNT(*) FROM vacancies WHERE status='applied'").fetchone()[0]}
+                    state['resume_context']=engine.store.resume_context()
+                    state['cloud_browser']=os.environ.get('HH_CLOUD_BROWSER')=='1'
+                    state.update(model=engine.reply_model.status(),model_working=engine.model_working,csrf=csrf,api=engine.api_status,captcha=engine.captcha_vacancy,running=engine.running or bool(engine.captcha_vacancy),connected=bool(engine.browser_status.get('logged_in')),
+                                 browser=engine.browser_status,activity='Ожидаю прохождения капчи' if engine.captcha_vacancy else engine.activity,connection_mode='browser',version='0.2')
                     return self.respond(200,state)
-                if route in ('/oauth/start','/oauth/callback'):
-                    return self.respond(410,{'error':'API для соискателей отключён hh.ru. Используй вход через браузер в разделе «Подключение».'})
+                if route=='/oauth/callback':
+                    try:
+                        detail=engine.finish_oauth(urllib.parse.parse_qs(parsed.query))
+                    except Exception:
+                        detail='Авторизация API не завершена. Вернись в помощник и повтори подключение. Коды и ключи скрыты.'
+                    page='<meta charset="utf-8"><h1>'+html.escape(detail)+'</h1><a href="/">Вернуться в помощник</a>'
+                    return self.respond(200,page.encode('utf-8'),'text/html; charset=utf-8')
                 return self.respond(404,{'error':'Не найдено'})
             except Exception as e:
                 self.respond(400,{'error':str(e)})
 
         def do_POST(self):
+            if not self.authenticated():
+                return
             origin=self.headers.get('Origin')
-            if not self.trusted() or self.headers.get('X-CSRF-Token')!=csrf or origin not in (None,f'http://127.0.0.1:{engine.port}',f'http://localhost:{engine.port}'):
+            if not self.trusted() or self.headers.get('X-CSRF-Token')!=csrf or origin not in (None,f'http://127.0.0.1:{engine.port}',f'http://localhost:{engine.port}',(os.environ.get('HH_PUBLIC_ORIGIN') or os.environ.get('RENDER_EXTERNAL_URL','_invalid_'))):
                 return self.respond(403,{'error':'Недопустимый источник запроса'})
             try:
                 length=int(self.headers.get('Content-Length','0'))
@@ -852,7 +1177,40 @@ def make_handler(engine):
                     raise ValueError('Недопустимый размер запроса')
                 payload=json.loads(self.rfile.read(length))
                 route=urllib.parse.urlparse(self.path).path
-                if route=='/api/settings':
+                if engine.captcha_vacancy and route in ('/api/search','/api/login','/api/open-chats','/api/session','/api/chats','/api/apply','/api/task') and not (route=='/api/task' and payload.get('dismiss')):
+                    raise ValueError('Пройди капчу в открытой вкладке hh.ru.')
+                if route=='/api/oauth':
+                    url=engine.start_oauth(payload.get('client_id'),payload.get('client_secret'))
+                    return self.respond(200,{'url':url})
+                elif route=='/api/resume-context':
+                    text=payload.get('text','')
+                    if not isinstance(text,str) or len(text)>40000:
+                        raise ValueError('Текст резюме должен быть короче 40 000 символов')
+                    with engine.store.connect() as db:
+                        db.execute("INSERT OR REPLACE INTO documents VALUES ('resume',?)",(text.strip(),))
+                elif route=='/api/model':
+                    engine.reply_model.configure(payload)
+                    return self.respond(200,engine.reply_model.status())
+                elif route=='/api/model/test':
+                    answer=engine.reply_model.request([{'role':'user','content':'Верни JSON: needs_reply=false, draft="", missing=[], reason="Проверка подключения"'}],engine.store.settings())
+                    engine.reply_model.error=''
+                    return self.respond(200,{'ok':True})
+                elif route=='/api/drafts':
+                    if not engine.store.settings().get('model_enabled'):
+                        raise ValueError('Подключи API модели в настройках')
+                    if engine.model_working or not engine.lock.acquire(blocking=False):
+                        raise ValueError('Сейчас выполняется другая операция. Повтори после её завершения.')
+                    engine.model_working=True
+                    def generate_drafts():
+                        try:
+                            engine.rebuild_hr_reviews(refresh_model=True,existing_only=True)
+                        except Exception:
+                            engine.reply_model.error='Не удалось обновить все черновики. Повтори запрос.'
+                        finally:
+                            engine.model_working=False
+                            engine.lock.release()
+                    threading.Thread(target=generate_drafts,daemon=True).start()
+                elif route=='/api/settings':
                     if 'client_secret' in payload or 'client_id' in payload:
                         raise ValueError('Ключи API больше не нужны. Используй вход в браузере.')
                     engine.store.save_settings(payload)
@@ -862,7 +1220,7 @@ def make_handler(engine):
                         raise ValueError('Операция уже выполняется')
                     def search_job():
                         try:
-                            engine.cycle(search_only=True)
+                            engine.cycle(search_only=True,dispatch=payload.get('dispatch') is True)
                         except Exception as e:
                             engine.store.event('error',str(e))
                     threading.Thread(target=search_job,daemon=True).start()
@@ -896,7 +1254,7 @@ def make_handler(engine):
                     if not engine.lock.acquire(blocking=False):
                         raise ValueError('Браузер занят: '+(engine.activity or 'выполняется операция')+'. Отправить ответ можно после её завершения.')
                     try:
-                        engine.resolve_task(int(payload['id']),str(payload.get('text','')),bool(payload.get('dismiss')))
+                        engine.resolve_task(int(payload['id']),str(payload.get('text','')),bool(payload.get('dismiss')),expected_ref=payload.get('expected_ref'))
                     finally:
                         engine.lock.release()
                 elif route=='/api/apply':
@@ -932,14 +1290,19 @@ def make_handler(engine):
 
 def main():
     parser=argparse.ArgumentParser()
-    parser.add_argument('--port',type=int,default=8765)
+    parser.add_argument('--port',type=int,default=int(os.environ.get('PORT','8765')))
+    parser.add_argument('--host',default=os.environ.get('HH_BIND_HOST','127.0.0.1'))
     parser.add_argument('--no-open',action='store_true')
     args=parser.parse_args()
+    if args.host not in ('127.0.0.1','localhost') and not os.environ.get('HH_ACCESS_PASSWORD'):
+        raise RuntimeError('Для внешнего доступа задай HH_ACCESS_PASSWORD и HTTPS-прокси')
     store=Store()
     engine=Engine(store,Vault())
+    if not os.environ.get('HH_DATABASE_URL'):
+        engine.rebuild_hr_reviews()
     engine.port=args.port
     try:
-        server=ThreadingHTTPServer(('127.0.0.1',args.port),make_handler(engine))
+        server=ThreadingHTTPServer((args.host,args.port),make_handler(engine))
     except OSError:
         if not args.no_open:
             webbrowser.open(f'http://127.0.0.1:{args.port}')
