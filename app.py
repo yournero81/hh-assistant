@@ -493,6 +493,8 @@ class BrowserBridge:
                 if not node or not Path(node).exists():
                     raise ValueError('Node.js не найден. Запусти Установить.cmd')
                 child_env=os.environ.copy()
+                if os.environ.get('HH_CLOUD_BROWSER')=='1':
+                    child_env.setdefault('NODE_OPTIONS','--max-old-space-size=96')
                 if self.vault and os.environ.get('HH_DATABASE_URL'):
                     state=self.vault.read().get('browser_state')
                     if state:

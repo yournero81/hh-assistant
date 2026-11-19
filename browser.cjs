@@ -8,7 +8,16 @@ const candidateProfile=process.env.HH_PROFILE_JSON?JSON.parse(process.env.HH_PRO
 let context;
 async function browser() {
   if (!context) {
-    context = await chromium.launchPersistentContext(process.env.HH_ASSISTANT_BROWSER_DIR||path.join(__dirname,'data','browser'), {headless:process.env.HH_ASSISTANT_HEADLESS==='1', viewport:{width:1200,height:850}});
+    const cloudArgs=process.env.HH_CLOUD_BROWSER==='1'?[
+      '--disable-dev-shm-usage','--disable-gpu','--disable-extensions',
+      '--disable-background-networking','--disable-component-update',
+      '--disable-default-apps','--disable-sync','--metrics-recording-only',
+      '--mute-audio','--no-first-run','--no-zygote','--single-process',
+      '--renderer-process-limit=1'
+    ]:[];
+    context = await chromium.launchPersistentContext(process.env.HH_ASSISTANT_BROWSER_DIR||path.join(__dirname,'data','browser'), {
+      headless:process.env.HH_ASSISTANT_HEADLESS==='1',viewport:{width:1200,height:850},args:cloudArgs
+    });
     const stateFile=process.env.HH_BROWSER_STATE_FILE;
     const rawState=stateFile?fs.readFileSync(stateFile,'utf8'):process.env.HH_BROWSER_STATE;
     if(rawState){
