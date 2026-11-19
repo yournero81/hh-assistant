@@ -1,6 +1,6 @@
 FROM node:22-bookworm-slim
 WORKDIR /app
-RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-venv ca-certificates nginx apache2-utils xvfb fluxbox x11vnc novnc websockify && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-venv ca-certificates nginx apache2-utils xvfb x11-utils fluxbox x11vnc novnc websockify && rm -rf /var/lib/apt/lists/*
 RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 COPY requirements-cloud.txt ./

@@ -84,11 +84,44 @@ def main():
         for proc in reversed(procs):
             if proc.poll() is None:proc.terminate()
     signal.signal(signal.SIGTERM,stop);signal.signal(signal.SIGINT,stop)
+
+    def display_ready():
+        return subprocess.run(
+            ['xdpyinfo','-display',':99'],env=env,
+            stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
+        ).returncode==0
+
+    def clear_stale_display():
+        """Remove :99 artefacts only when their recorded Xvfb is not usable."""
+        lock=Path('/tmp/.X99-lock')
+        if display_ready():
+            return
+        if lock.exists():
+            try:
+                pid=int(lock.read_text().strip())
+                cmdline=Path(f'/proc/{pid}/cmdline').read_bytes().replace(b'\0',b' ')
+                if b'Xvfb' in cmdline and b':99' in cmdline:
+                    os.kill(pid,signal.SIGTERM)
+                    for _ in range(30):
+                        if not Path(f'/proc/{pid}').exists():break
+                        time.sleep(.1)
+            except (OSError,ValueError):
+                pass
+        if not display_ready():
+            lock.unlink(missing_ok=True)
+            Path('/tmp/.X11-unix/X99').unlink(missing_ok=True)
+
     try:
-        start(['Xvfb',':99','-screen','0','1200x850x24','-nolisten','tcp'])
-        for _ in range(50):
-            if Path('/tmp/.X11-unix/X99').exists():break
-            time.sleep(.1)
+        clear_stale_display()
+        if not display_ready():
+            xvfb=start(['Xvfb',':99','-screen','0','1200x850x24','-nolisten','tcp','-ac'])
+            for _ in range(100):
+                if display_ready():break
+                if xvfb.poll() is not None:
+                    raise RuntimeError('Xvfb exited before display :99 became ready')
+                time.sleep(.1)
+        if not display_ready():
+            raise RuntimeError('Display :99 did not become ready')
         start(['fluxbox'])
         start(['x11vnc','-display',':99','-localhost','-rfbport','5900','-forever','-shared','-nopw','-quiet'])
         start(['websockify','--web=/usr/share/novnc','127.0.0.1:6080','127.0.0.1:5900'])
