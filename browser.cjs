@@ -12,7 +12,7 @@ async function browser() {
       '--disable-dev-shm-usage','--disable-gpu','--disable-extensions',
       '--disable-background-networking','--disable-component-update',
       '--disable-default-apps','--disable-sync','--metrics-recording-only',
-      '--mute-audio','--no-first-run','--no-zygote','--single-process',
+      '--mute-audio','--no-first-run','--no-zygote',
       '--renderer-process-limit=1'
     ]:[];
     context = await chromium.launchPersistentContext(process.env.HH_ASSISTANT_BROWSER_DIR||path.join(__dirname,'data','browser'), {
