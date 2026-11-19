@@ -496,7 +496,11 @@ class BrowserBridge:
                 if self.vault and os.environ.get('HH_DATABASE_URL'):
                     state=self.vault.read().get('browser_state')
                     if state:
-                        child_env['HH_BROWSER_STATE']=json.dumps(state)
+                        DATA.mkdir(parents=True,exist_ok=True)
+                        state_path=DATA/f'.browser-state-{os.getpid()}-{uuid.uuid4().hex}.json'
+                        state_path.write_text(json.dumps(state),encoding='utf-8')
+                        os.chmod(state_path,0o600)
+                        child_env['HH_BROWSER_STATE_FILE']=str(state_path)
                 self.proc=subprocess.Popen([node,str(ROOT/'browser.cjs')],cwd=ROOT,stdin=subprocess.PIPE,
                                            stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,encoding='utf-8',creationflags=flags,env=child_env)
             self.proc.stdin.write(json.dumps(command,ensure_ascii=False)+'\n')

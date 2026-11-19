@@ -1,6 +1,7 @@
 const {chromium} = require('playwright');
 const readline = require('node:readline');
 const path = require('node:path');
+const fs = require('node:fs');
 const chats = require('./browser-chats.cjs');
 const questionnaire=require('./questionnaire.cjs');
 const candidateProfile=process.env.HH_PROFILE_JSON?JSON.parse(process.env.HH_PROFILE_JSON):require('./profile.json');
@@ -8,11 +9,15 @@ let context;
 async function browser() {
   if (!context) {
     context = await chromium.launchPersistentContext(process.env.HH_ASSISTANT_BROWSER_DIR||path.join(__dirname,'data','browser'), {headless:process.env.HH_ASSISTANT_HEADLESS==='1', viewport:{width:1200,height:850}});
-    if(process.env.HH_BROWSER_STATE){
-      const saved=JSON.parse(process.env.HH_BROWSER_STATE);
+    const stateFile=process.env.HH_BROWSER_STATE_FILE;
+    const rawState=stateFile?fs.readFileSync(stateFile,'utf8'):process.env.HH_BROWSER_STATE;
+    if(rawState){
+      const saved=JSON.parse(rawState);
       if(saved.cookies?.length)await context.addCookies(saved.cookies);
       await context.addInitScript(origins=>{const saved=origins.find(o=>o.origin===location.origin);if(saved)for(const item of saved.localStorage||[])localStorage.setItem(item.name,item.value);},saved.origins||[]);
       delete process.env.HH_BROWSER_STATE;
+      delete process.env.HH_BROWSER_STATE_FILE;
+      if(stateFile)try{fs.unlinkSync(stateFile);}catch{}
     }
     context.setDefaultTimeout(12000);
     context.on('close',()=>context=null);
